@@ -1,0 +1,56 @@
+name: mirror FPL API
+
+on:
+  schedule:
+    # Every two hours. Deadlines are usually 18:30 UK on a Friday, so this
+    # guarantees a snapshot inside two hours of any deadline without hammering
+    # the API. Times are UTC; GitHub runs cron late under load, which is fine
+    # here because nothing depends on the exact minute.
+    - cron: "5 */2 * * *"
+  workflow_dispatch:        # so you can force a refresh from the Actions tab
+
+# The workflow commits back to its own repo, so it needs write permission.
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install --quiet requests
+
+      - name: Fetch the API
+        env:
+          FPL_ENTRY_ID: "420549"
+          # Optional. Set either of these in Settings > Secrets and variables >
+          # Actions. Without them the public endpoints still mirror fine and
+          # only my_team.json is missing. See README.
+          FPL_COOKIE: ${{ secrets.FPL_COOKIE }}
+          FPL_EMAIL: ${{ secrets.FPL_EMAIL }}
+          FPL_PASSWORD: ${{ secrets.FPL_PASSWORD }}
+        run: python fetch.py --out data
+
+      - name: Commit whatever changed
+        run: |
+          git config user.name  "fpl-mirror"
+          git config user.email "fpl-mirror@users.noreply.github.com"
+          git add -A data
+          # A quiet hour genuinely changes nothing, and an empty commit would
+          # just add noise to the log. `git commit` exits 1 on no changes, so
+          # the guard is deliberate rather than a swallowed error.
+          if git diff --cached --quiet; then
+            echo "nothing changed"
+          else
+            git commit -m "mirror $(date -u +'%Y-%m-%dT%H:%MZ')"
+            git push
+          fi
