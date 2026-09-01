@@ -15,8 +15,18 @@ WHAT IT WRITES (into --out, default ./data)
   entry.json          /api/entry/{id}/           public
   history.json        /api/entry/{id}/history/   public
   picks_gw{n}.json    /api/entry/{id}/event/{n}/picks/   public, per finished GW
+  transfers.json      /api/entry/{id}/transfers/  public, FULL transfer history
   my_team.json        /api/my-team/{id}/         LOGIN REQUIRED
   status.json         what succeeded, what did not, and when
+
+WHY transfers.json (added 2026-09-01, after a hand-pasted squad went stale and
+wrong). picks_gw{n} only shows the squad LOCKED at gameweek n's deadline, so
+between deadlines it is blind to any transfer already made. transfers.json is
+the full, public, ordered log of every transfer on the entry (element in,
+element out, event, timestamp), including wildcard transfers (cost 0). Replayed
+on top of picks_gw1 (the first locked squad) it reconstructs the CURRENT squad
+at any point in the season, live, with no login and no dependence on a deadline
+having passed. See ingest_live_mirror.py:squad_from_transfers.
 
 STATUS.JSON IS NOT OPTIONAL DECORATION. It is the whole point of the honesty of
 this thing: an authentication failure here would otherwise show up in the
@@ -140,8 +150,29 @@ def main(argv=None) -> int:
     events = bs.get("events") or []
     cur = next((e["id"] for e in events if e.get("is_current")), None)
     nxt = next((e["id"] for e in events if e.get("is_next")), None)
-    finished = [e["id"] for e in events if e.get("finished")]
+
+    # WHICH GAMEWEEKS HAVE PICKS. Keyed on the DEADLINE HAVING PASSED, not on
+    # the `finished` flag. Picks become public the moment the deadline goes;
+    # `finished` is set later, after bonus points and data checking, and FPL is
+    # in no hurry about it. First run of this mirror, 2026-08-25 at 10:14 UTC:
+    # GW1 had been over for fifteen hours, every match played, and the flag was
+    # still False, so a finished-only rule fetched no picks at all and the
+    # decision system had no squad. Same trap the scheduled job already handles
+    # for results ("the clock, not the flag"); this is the same lesson learned
+    # twice in one week, in two different files.
+    passed = []
+    for e in events:
+        dl = e.get("deadline_time")
+        if not dl:
+            continue
+        try:
+            t = datetime.fromisoformat(str(dl).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if t < datetime.now(timezone.utc):
+            passed.append(e["id"])
     status["current_gw"], status["next_gw"] = cur, nxt
+    status["deadlines_passed"] = passed[-6:]
 
     for name, url in (("fixtures", f"{BASE}/fixtures/"),
                       ("entry", f"{BASE}/entry/{entry}/"),
@@ -153,13 +184,23 @@ def main(argv=None) -> int:
             status["ok"].append(name)
             write(out, f"{name}.json", obj)
 
-    for gw in sorted(finished)[-max(1, a.back):]:
+    for gw in sorted(passed)[-max(1, a.back):]:
         obj, err = get(sess, f"{BASE}/entry/{entry}/event/{gw}/picks/")
         if obj is None:
             status["failed"][f"picks_gw{gw}"] = err
         else:
             status["ok"].append(f"picks_gw{gw}")
             write(out, f"picks_gw{gw}.json", obj)
+
+    # Full transfer history, public, no login. This is what lets the consumer
+    # reconstruct the CURRENT squad between deadlines, when picks_gw{n} is
+    # already out of date. See the module docstring.
+    obj, err = get(sess, f"{BASE}/entry/{entry}/transfers/")
+    if obj is None:
+        status["failed"]["transfers"] = err
+    else:
+        status["ok"].append("transfers")
+        write(out, "transfers.json", obj)
 
     # ---- the authenticated bit, which is allowed to fail.
     authed, how = authenticate(sess)
